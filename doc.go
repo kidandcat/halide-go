@@ -8,7 +8,8 @@
 //
 // Go memory that a call hands to native code is pinned for the duration of
 // the call and kept alive until the call returns. Halide's thread pool runs
-// inside the loaded library; [Library.Close] shuts that pool down.
+// inside the loaded library. The last [Library.Close] for a file joins that
+// pool. The mapping stays loaded for the process lifetime.
 //
 // The usual way to produce a library is the halide-gen command:
 //

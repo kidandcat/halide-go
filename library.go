@@ -13,19 +13,39 @@ import (
 )
 
 // Library is a loaded Halide pipeline library, either a native shared library
-// or a wasm module. Calls on one Library are serialized. Close shuts down
-// Halide's thread pool (native) and releases the module.
+// or a wasm module. Calls on one native file are serialized. Close drops this
+// user's reference; the last reference shuts down Halide's thread pool.
 type Library struct {
 	name   string
 	mu     sync.Mutex
 	handle uintptr
+	image  *loadedImage
 	wasm   *wasmState
+}
 
+// loadedImage is one dlopen/LoadLibrary of a native pipeline file.
+// The mapping is never unloaded: Halide registers a destructor that joins
+// its thread pool, and macOS dyld finalizes thread-local state during
+// dlclose. Doing that while any thread is still inside the image segfaults
+// in purego.Dlclose (observed on arm64, PC == fault address). The pool is
+// shut down when the last Library on this file closes, which joins the
+// workers first. A later Open of the same path reuses the mapping; the next
+// parallel call starts the pool again.
+type loadedImage struct {
+	mu       sync.Mutex
+	path     string
+	handle   uintptr
+	refs     int
 	shutdown func()
 	callback uintptr
 	errN     atomic.Int32
 	errBuf   [2048]byte
 }
+
+var (
+	imagesMu sync.Mutex
+	images   = map[string]*loadedImage{}
+)
 
 // Func is one exported pipeline inside a Library.
 type Func struct {
@@ -35,18 +55,40 @@ type Func struct {
 	argv func(*uintptr) int32
 }
 
-// Open loads a native shared library from path.
+// Open loads a native shared library from path. The same path shares one
+// mapping and one Halide thread pool for the life of the process.
 func Open(path string) (*Library, error) {
 	if unsafe.Sizeof(halideBuffer{}) != 56 {
 		return nil, fmt.Errorf("halide: native ABI requires a 56-byte halide_buffer_t (64-bit), have %d", unsafe.Sizeof(halideBuffer{}))
 	}
-	h, err := loadShared(path)
+	abs, err := filepath.Abs(path)
 	if err != nil {
 		return nil, fmt.Errorf("halide: open %s: %w", path, err)
 	}
-	l := &Library{name: filepath.Base(path), handle: h}
-	l.installHandler()
-	return l, nil
+	img, err := acquireImage(abs)
+	if err != nil {
+		return nil, fmt.Errorf("halide: open %s: %w", path, err)
+	}
+	return &Library{name: filepath.Base(path), handle: img.handle, image: img}, nil
+}
+
+func acquireImage(path string) (*loadedImage, error) {
+	imagesMu.Lock()
+	defer imagesMu.Unlock()
+	if img, ok := images[path]; ok {
+		img.mu.Lock()
+		img.refs++
+		img.mu.Unlock()
+		return img, nil
+	}
+	h, err := loadShared(path)
+	if err != nil {
+		return nil, err
+	}
+	img := &loadedImage{path: path, handle: h, refs: 1}
+	img.installHandler()
+	images[path] = img
+	return img, nil
 }
 
 // OpenWASM instantiates a Halide wasm module compiled for
@@ -59,7 +101,9 @@ func OpenWASM(module []byte) (*Library, error) {
 	return &Library{name: "wasm", wasm: st}, nil
 }
 
-// Close releases the library. It is safe to call more than once.
+// Close releases this user's reference. It is safe to call more than once.
+// The last Close of a native file calls halide_shutdown_thread_pool and
+// joins the workers. The file stays mapped; see loadedImage.
 func (l *Library) Close() error {
 	if l == nil {
 		return nil
@@ -71,16 +115,30 @@ func (l *Library) Close() error {
 		l.wasm = nil
 		return err
 	}
-	if l.handle == 0 {
+	if l.image == nil {
 		return nil
 	}
-	if l.shutdown != nil {
-		l.shutdown()
-		l.shutdown = nil
-	}
-	err := closeShared(l.handle)
+	img := l.image
+	l.image = nil
 	l.handle = 0
-	return err
+	img.release()
+	return nil
+}
+
+func (img *loadedImage) release() {
+	img.mu.Lock()
+	defer img.mu.Unlock()
+	if img.refs == 0 {
+		return
+	}
+	img.refs--
+	if img.refs > 0 || img.shutdown == nil {
+		return
+	}
+	// Join workers before any later Open reuses this mapping. Do not
+	// dlclose/FreeLibrary: Halide's destructor and the loader's TLS
+	// teardown race with threads that are still leaving the image.
+	img.shutdown()
 }
 
 // Func looks up name_argv (and name_metadata when it is present).
@@ -94,7 +152,7 @@ func (l *Library) Func(name string) (*Func, error) {
 	if l.wasm != nil {
 		return l.wasm.bind(l, name)
 	}
-	if l.handle == 0 {
+	if l.handle == 0 || l.image == nil {
 		return nil, fmt.Errorf("halide: library is closed")
 	}
 	sym, err := lookupShared(l.handle, name+"_argv")
@@ -160,10 +218,13 @@ func (f *Func) Call(args ...any) error {
 func (l *Library) callNative(f *Func, args []any) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.handle == 0 {
+	img := l.image
+	if img == nil || l.handle == 0 {
 		return fmt.Errorf("halide: library is closed")
 	}
-	l.errN.Store(0)
+	img.mu.Lock()
+	defer img.mu.Unlock()
+	img.errN.Store(0)
 
 	slots := make([]uintptr, len(args))
 	boxes := make([]scalarSlot, len(args))
@@ -201,7 +262,7 @@ func (l *Library) callNative(f *Func, args []any) error {
 	runtime.KeepAlive(boxes)
 	runtime.KeepAlive(slots)
 	if rc != 0 {
-		return &PipelineError{Func: f.name, Code: rc, Text: l.errText()}
+		return &PipelineError{Func: f.name, Code: rc, Text: img.errText()}
 	}
 	return nil
 }
@@ -219,51 +280,51 @@ type scalarSlot struct {
 	v uint64
 }
 
-func (l *Library) installHandler() {
-	if sym, err := lookupShared(l.handle, "halide_shutdown_thread_pool"); err == nil {
+func (img *loadedImage) installHandler() {
+	if sym, err := lookupShared(img.handle, "halide_shutdown_thread_pool"); err == nil {
 		var shutdown func()
 		purego.RegisterFunc(&shutdown, sym)
-		l.shutdown = shutdown
+		img.shutdown = shutdown
 	}
-	sym, err := lookupShared(l.handle, "halide_set_error_handler")
+	sym, err := lookupShared(img.handle, "halide_set_error_handler")
 	if err != nil {
 		return
 	}
 	var set func(uintptr)
 	purego.RegisterFunc(&set, sym)
-	l.callback = purego.NewCallback(func(user, msg uintptr) uintptr {
-		l.capture(msg)
+	img.callback = purego.NewCallback(func(user, msg uintptr) uintptr {
+		img.capture(msg)
 		return 0
 	})
-	set(l.callback)
+	set(img.callback)
 }
 
-func (l *Library) capture(msg uintptr) {
+func (img *loadedImage) capture(msg uintptr) {
 	if msg == 0 {
-		l.errN.Store(0)
+		img.errN.Store(0)
 		return
 	}
 	n := 0
-	for n < len(l.errBuf) {
+	for n < len(img.errBuf) {
 		b := *(*byte)(unsafe.Pointer(msg + uintptr(n)))
 		if b == 0 {
 			break
 		}
-		l.errBuf[n] = b
+		img.errBuf[n] = b
 		n++
 	}
-	l.errN.Store(int32(n))
+	img.errN.Store(int32(n))
 }
 
-func (l *Library) errText() string {
-	n := int(l.errN.Load())
+func (img *loadedImage) errText() string {
+	n := int(img.errN.Load())
 	if n <= 0 {
 		return ""
 	}
-	if n > len(l.errBuf) {
-		n = len(l.errBuf)
+	if n > len(img.errBuf) {
+		n = len(img.errBuf)
 	}
-	return string(l.errBuf[:n])
+	return string(img.errBuf[:n])
 }
 
 func (l *Library) nativeMetadata(name string) ([]Arg, error) {

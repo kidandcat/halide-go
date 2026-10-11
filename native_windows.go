@@ -14,6 +14,8 @@ func lookupShared(handle uintptr, name string) (uintptr, error) {
 	return uintptr(addr), err
 }
 
+// closeShared unloads a native library. Library.Close does not call it.
+// FreeLibrary has the same thread-pool teardown hazard as dlclose.
 func closeShared(handle uintptr) error {
 	return syscall.FreeLibrary(syscall.Handle(handle))
 }

@@ -7,16 +7,94 @@ import (
 	"testing"
 )
 
-func TestRuntimeErrorHandler(t *testing.T) {
+func TestReuseAfterClose(t *testing.T) {
 	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
 		t.Skip("runs the committed linux/amd64 library")
 	}
+	so := pipelineSO(t)
+	blur := func(lib *Library) {
+		t.Helper()
+		fn, err := lib.Func("blur")
+		if err != nil {
+			t.Fatal(err)
+		}
+		const n = 64
+		src := make([]byte, n*n)
+		dst := make([]byte, n*n)
+		for i := range src {
+			src[i] = byte(i)
+		}
+		in, err := Slice(src, n, n)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out, err := Slice(dst, n, n)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := fn.Call(in, out); err != nil {
+			t.Fatal(err)
+		}
+		if dst[0] == 0 && dst[n+1] == 0 {
+			t.Fatal("blur wrote nothing")
+		}
+	}
+
+	// Two live opens share the mapping. Closing one must not shut the
+	// pool down underneath the other, and must not unload the file.
+	a, err := Open(so)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := Open(so)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.handle != b.handle {
+		t.Fatalf("handles differ: %#x %#x", a.handle, b.handle)
+	}
+	blur(a)
+	blur(b)
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+	blur(b)
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The last Close joins the workers and leaves the mapping in place.
+	// Opening again must run, including after the pool has been shut down.
+	for i := 0; i < 8; i++ {
+		lib, err := Open(so)
+		if err != nil {
+			t.Fatal(err)
+		}
+		blur(lib)
+		if err := lib.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func pipelineSO(t *testing.T) string {
+	t.Helper()
 	_, file, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("no caller")
 	}
-	root := filepath.Dir(file)
-	so := filepath.Join(root, "filters", "libs", "linux_amd64", "libfilters.so")
+	return filepath.Join(filepath.Dir(file), "filters", "libs", "linux_amd64", "libfilters.so")
+}
+
+func TestRuntimeErrorHandler(t *testing.T) {
+	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
+		t.Skip("runs the committed linux/amd64 library")
+	}
+	so := pipelineSO(t)
+	root := filepath.Dir(filepath.Dir(filepath.Dir(filepath.Dir(so))))
 	lib, err := Open(so)
 	if err != nil {
 		t.Fatal(err)

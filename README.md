@@ -124,7 +124,7 @@ Targets (`-targets`, default `all`):
 
 x86-64 is AVX2 + FMA + SSE4.1 (Haswell and newer). The host used to build the committed libraries also has AVX-512; that is intentionally not in the target, so the `.so` loads on machines without AVX-512. Each library contains one Halide runtime plus every filter, so there is one thread pool per process per loaded library.
 
-The tool compiles each filter with `target=<triple>-no_runtime` and links those objects with a single runtime object. At runtime the native file is extracted to a content-addressed directory under the temp dir and opened with `dlopen` (`LoadLibrary` on Windows). Wasm is instantiated in process.
+The tool compiles each filter with `target=<triple>-no_runtime` and links those objects with a single runtime object. At runtime the native file is extracted to a content-addressed directory under the temp dir and opened with `dlopen` (`LoadLibrary` on Windows). The same path shares one mapping. `Close` joins Halide's worker threads when the last user of that file closes, and leaves the mapping loaded for the rest of the process. Wasm is instantiated in process.
 
 Python example (one generator per file):
 
@@ -202,6 +202,7 @@ Wasm is single-threaded (`parallel` is not scheduled on that target). Each call 
 - Little-endian only. Every target this module builds is little-endian.
 - One `Library` runs one call at a time. Two libraries can run at the same time.
 - Each native library installs one `purego.NewCallback`, which purego does not release. Load a handful of libraries, not one per request.
+- `Close` does not call `dlclose` or `FreeLibrary`. Halide's runtime registers a destructor that joins the thread pool, and macOS runs dyld thread-local teardown as part of `dlclose`. Unloading while a worker is still inside the image segfaults (`purego.Dlclose`, arm64, fault address equal to the PC). The last `Close` calls `halide_shutdown_thread_pool` instead, which joins the workers while the file is still mapped.
 - The Go slice must stay still for the duration of `Call`. Do not reslice or mutate it from another goroutine during the call. `Call` pins it so the garbage collector will not move it.
 - A blur (or Sobel) that uses the same buffer for input and output reads neighbors while it writes them. Use two buffers.
 - Wasm copies, so a 4096² frame is tens of milliseconds even when the compiled loop is short. Use it when you want one portable binary, and the native library when you want the speed.
